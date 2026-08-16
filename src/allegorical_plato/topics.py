@@ -16,8 +16,8 @@ from allegorical_plato.preprocessing import (
     classify_term,
     clean_text,
     detect_proper_name_tokens,
-    topic_features,
     tokenize,
+    topic_features,
 )
 
 
@@ -116,7 +116,12 @@ def analyze_topics(
         raise ValueError("Topic, cluster, term, and document-frequency counts must be positive")
 
     texts = passages["text"].to_list()
-    analysis_documents = ["\n".join(items) for items in passages["_utterance_texts"].to_list()]
+    has_boundaries = "_utterance_texts" in passages.columns
+    analysis_documents = (
+        ["\n".join(items) for items in passages["_utterance_texts"].to_list()]
+        if has_boundaries
+        else texts
+    )
     vectorizer = TfidfVectorizer(
         analyzer=partial(topic_features, language=language),
         lowercase=False,
@@ -160,7 +165,8 @@ def analyze_topics(
     )
     coordinates = PCA(n_components=2, random_state=random_state).fit_transform(shares)
     primary_topics = shares.argmax(axis=1)
-    passage_result = passages.drop("_utterance_texts").with_columns(
+    public_passages = passages.drop("_utterance_texts") if has_boundaries else passages
+    passage_result = public_passages.with_columns(
         pl.Series("primary_topic", primary_topics),
         pl.Series("topic_share", shares.max(axis=1)),
         pl.Series("cluster", clusters),

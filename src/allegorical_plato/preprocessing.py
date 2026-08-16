@@ -6,6 +6,7 @@ import re
 import unicodedata
 from collections import Counter
 from collections.abc import Iterable, Sequence
+from itertools import pairwise
 
 from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
 
@@ -348,11 +349,7 @@ def topic_features(document: str, *, language: str) -> list[str]:
     for utterance in document.splitlines() or [document]:
         tokens = topic_tokens(utterance, language=language)
         features.extend(tokens)
-        features.extend(
-            f"{left} {right}"
-            for left, right in zip(tokens, tokens[1:], strict=False)
-            if left != right
-        )
+        features.extend(f"{left} {right}" for left, right in pairwise(tokens) if left != right)
     return features
 
 

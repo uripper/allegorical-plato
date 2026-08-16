@@ -1,5 +1,6 @@
 """Command-line interface for corpus exploration."""
 
+import os
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated
@@ -8,9 +9,11 @@ import typer
 
 from allegorical_plato.corpus import load_corpus, profile
 from allegorical_plato.features import contrast_terms, distinctive_terms, group_socrates
+from allegorical_plato.topics import analyze_topics, build_passages
+from allegorical_plato.viz import render_topic_visuals
 
 app = typer.Typer(no_args_is_help=True, help="Explore linguistic patterns in Plato's corpus.")
-DEFAULT_DATA_PATH = Path("data/corpus/utterances.parquet")
+DEFAULT_DATA_PATH = Path(os.environ.get("ALLEGORICAL_PLATO_DATA", "data/corpus/utterances.parquet"))
 DataPath = Annotated[Path, typer.Option("--data", "-d", help="Canonical utterance Parquet.")]
 
 
@@ -126,6 +129,89 @@ def terms(
             csv_output = output.with_suffix(".csv")
             result.write_csv(csv_output)
             typer.echo(f"Wrote browsing copy to {csv_output}")
+
+
+@app.command("discover-topics")
+def topics(
+    data: DataPath = DEFAULT_DATA_PATH,
+    output_dir: Annotated[Path, typer.Option("--output-dir", "-o")] = Path("outputs"),
+    language: Annotated[Language | None, typer.Option(help="Analyze only one language.")] = None,
+    target_words: Annotated[
+        int,
+        typer.Option(min=25, help="Approximate passage size; dialogue boundaries are preserved."),
+    ] = 200,
+    n_topics: Annotated[int, typer.Option(min=2)] = 8,
+    n_clusters: Annotated[int, typer.Option(min=2)] = 8,
+    terms_per_topic: Annotated[int, typer.Option(min=1)] = 15,
+    min_df: Annotated[int, typer.Option(min=1)] = 2,
+    seed: Annotated[int, typer.Option(help="Random seed for reproducible results.")] = 42,
+    text_column: Annotated[str | None, typer.Option()] = None,
+    speaker_column: Annotated[str | None, typer.Option()] = None,
+    work_column: Annotated[str | None, typer.Option()] = None,
+    csv: Annotated[
+        bool, typer.Option(help="Also write CSV tables for websites and manual browsing.")
+    ] = True,
+) -> None:
+    """Discover passage-level NMF topics and clusters for visualization."""
+    for selected in _languages(language):
+        corpus = load_corpus(
+            data,
+            text_column=text_column,
+            speaker_column=speaker_column,
+            work_column=work_column,
+            language=selected.value,
+        )
+        passages = build_passages(corpus.utterances, target_words=target_words)
+        result = analyze_topics(
+            passages,
+            language=selected.value,
+            n_topics=n_topics,
+            n_clusters=n_clusters,
+            terms_per_topic=terms_per_topic,
+            min_df=min_df,
+            random_state=seed,
+        )
+        language_dir = output_dir / selected.value / "topics"
+        language_dir.mkdir(parents=True, exist_ok=True)
+        tables = {
+            "passages": result.passages,
+            "topic_terms": result.topic_terms,
+            "passage_topics": result.passage_topics,
+            "cluster_topics": result.cluster_topics,
+        }
+        for name, table in tables.items():
+            output = language_dir / f"{name}.parquet"
+            table.write_parquet(output)
+            if csv:
+                table.write_csv(output.with_suffix(".csv"))
+        typer.echo(
+            f"Wrote {passages.height:,} {selected.value} passages, {n_topics} topics, "
+            f"and {n_clusters} clusters to {language_dir}"
+        )
+
+
+@app.command("render-visuals")
+def visuals(
+    input_dir: Annotated[
+        Path, typer.Option("--input-dir", "-i", help="Root containing language/topic tables.")
+    ] = Path("outputs"),
+    output_dir: Annotated[
+        Path, typer.Option("--output-dir", "-o", help="Root for rendered visualizations.")
+    ] = Path("outputs"),
+    language: Annotated[Language | None, typer.Option(help="Render only one language.")] = None,
+    png: Annotated[bool, typer.Option(help="Write high-resolution PNG images.")] = True,
+    svg: Annotated[bool, typer.Option(help="Write scalable SVG images.")] = True,
+    dpi: Annotated[int, typer.Option(min=72, max=600)] = 220,
+) -> None:
+    """Render a coordinated suite of static topic visualizations."""
+    formats = [name for name, enabled in (("png", png), ("svg", svg)) if enabled]
+    if not formats:
+        raise typer.BadParameter("Enable at least one of --png or --svg")
+    for selected in _languages(language):
+        topic_dir = input_dir / selected.value / "topics"
+        visual_dir = output_dir / selected.value / "visuals"
+        written = render_topic_visuals(topic_dir, visual_dir, formats=formats, dpi=dpi)
+        typer.echo(f"Wrote {len(written)} {selected.value} visual files to {visual_dir}")
 
 
 if __name__ == "__main__":

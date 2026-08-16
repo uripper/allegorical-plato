@@ -6,6 +6,7 @@ from pathlib import Path
 import polars as pl
 
 TEXT_CANDIDATES = (
+    "text_topic",
     "text_clean",
     "utterance",
     "text",

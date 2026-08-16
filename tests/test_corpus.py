@@ -4,7 +4,8 @@ import polars as pl
 
 from allegorical_plato.corpus import load_corpus, profile
 from allegorical_plato.features import contrast_terms, distinctive_terms, group_socrates
-from allegorical_plato.preprocessing import classify_term, tokenize
+from allegorical_plato.preprocessing import classify_term, tokenize, topic_features
+from allegorical_plato.topics import analyze_topics, build_passages
 
 
 def test_load_and_profile(tmp_path: Path) -> None:
@@ -62,6 +63,26 @@ def test_prefers_canonical_clean_speech_schema(tmp_path: Path) -> None:
     assert corpus.speaker_column == "speaker_id"
     assert corpus.text_column == "text_clean"
     assert corpus.utterances.select("speaker", "text").rows() == [("socrates", "Clean speech")]
+
+
+def test_prefers_analysis_text_without_changing_canonical_text(tmp_path: Path) -> None:
+    path = tmp_path / "corpus.parquet"
+    pl.DataFrame(
+        {
+            "work_id": ["dialogue"],
+            "language": ["grc"],
+            "segment_type": ["speech"],
+            "speaker_id": ["socrates"],
+            "text_clean": ["τοίνυν σώματος"],
+            "text_topic": ["σῶμα"],
+        }
+    ).write_parquet(path)
+
+    corpus = load_corpus(path, language="grc")
+
+    assert corpus.text_column == "text_topic"
+    assert corpus.frame["text_clean"].item() == "τοίνυν σώματος"
+    assert corpus.utterances["text"].item() == "σῶμα"
 
 
 def test_distinctive_terms() -> None:
@@ -182,3 +203,80 @@ def test_lexical_categories_and_editorial_filtering() -> None:
         == "editorial_artifact"
     )
     assert tokenize("Cp. Plat. Laws") == ["laws"]
+
+
+def test_greek_topic_features_match_folded_stopwords():
+    features = topic_features(
+        "τοίνυν εἶπον πάλιν ναί οὐκοῦν ἄρα γάρ μέν δέ σῶμα",
+        language="grc",
+    )
+
+    assert features == ["σῶμα"]
+
+
+def test_topic_bigrams_do_not_cross_utterance_boundaries_or_repeat():
+    features = topic_features("beautiful\nbeautiful things", language="eng")
+
+    assert "beautiful beautiful" not in features
+    assert "beautiful things" in features
+
+
+def test_build_passages_preserves_dialogue_boundaries_and_sequence() -> None:
+    utterances = pl.DataFrame(
+        {
+            "work": ["one", "one", "one", "two"],
+            "speaker": ["B", "A", "A", "C"],
+            "text": ["third ending", "first beginning", "second middle", "separate work"],
+            "sequence": [3, 1, 2, 1],
+        }
+    )
+
+    passages = build_passages(utterances, target_words=4)
+
+    assert passages["passage_id"].to_list() == ["one__0001", "one__0002", "two__0001"]
+    assert passages[0, "text"] == "first beginning second middle"
+    assert passages[0, "speaker"] == "A"
+    assert passages[1, "sequence_start"] == 3
+    assert passages[2, "work"] == "two"
+
+
+def test_topic_analysis_produces_tidy_visualization_tables() -> None:
+    passages = pl.DataFrame(
+        {
+            "passage_id": [f"work__{index:04d}" for index in range(1, 7)],
+            "work": ["work"] * 6,
+            "passage_number": list(range(1, 7)),
+            "speaker": ["A", "A", "A", "B", "B", "B"],
+            "dominant_speaker": ["A", "A", "A", "B", "B", "B"],
+            "dominant_speaker_share": [1.0] * 6,
+            "speakers": ["A", "A", "A", "B", "B", "B"],
+            "text": [
+                "number harmony ratio music",
+                "number ratio measure harmony",
+                "music harmony number measure",
+                "justice city law guardian",
+                "justice law ruler city",
+                "guardian city justice ruler",
+            ],
+            "word_count": [4] * 6,
+            "utterance_count": [1] * 6,
+        }
+    )
+
+    result = analyze_topics(
+        passages,
+        language="eng",
+        n_topics=2,
+        n_clusters=2,
+        terms_per_topic=3,
+        min_df=1,
+    )
+
+    assert result.passages.height == 6
+    assert {"primary_topic", "topic_share", "cluster", "x", "y"}.issubset(result.passages.columns)
+    assert result.topic_terms.height == 6
+    assert "term_category" in result.topic_terms.columns
+    assert result.passage_topics.height == 12
+    assert result.cluster_topics["cluster"].n_unique() == 2
+    shares = result.passage_topics.group_by("passage_id").agg(pl.col("share").sum())
+    assert all(abs(value - 1.0) < 1e-9 for value in shares["share"])

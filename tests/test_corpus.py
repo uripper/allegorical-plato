@@ -85,6 +85,34 @@ def test_prefers_analysis_text_without_changing_canonical_text(tmp_path: Path) -
     assert corpus.utterances["text"].item() == "σῶμα"
 
 
+def test_topic_text_falls_back_only_for_works_without_speech_markup(tmp_path: Path) -> None:
+    path = tmp_path / "corpus.parquet"
+    pl.DataFrame(
+        {
+            "work_id": ["dialogue", "dialogue", "apology", "apology", "apology"],
+            "language": ["eng"] * 5,
+            "segment_type": ["speech", "narration", "narration", "unattributed_speech", "heading"],
+            "speaker_id": ["socrates", None, None, None, None],
+            "text_clean": [
+                "ordinary speech",
+                "duplicated quotation",
+                "defense speech",
+                "unattributed ending",
+                "Apology",
+            ],
+        }
+    ).write_parquet(path)
+
+    corpus = load_corpus(path, language="eng")
+
+    assert corpus.utterances.select("work", "text").rows() == [("dialogue", "ordinary speech")]
+    assert corpus.topic_utterances.select("work", "speaker", "text").rows() == [
+        ("dialogue", "socrates", "ordinary speech"),
+        ("apology", "unattributed", "defense speech"),
+        ("apology", "unattributed", "unattributed ending"),
+    ]
+
+
 def test_distinctive_terms() -> None:
     frame = pl.DataFrame(
         {
@@ -238,6 +266,35 @@ def test_build_passages_preserves_dialogue_boundaries_and_sequence() -> None:
     assert passages[0, "speaker"] == "A"
     assert passages[1, "sequence_start"] == 3
     assert passages[2, "work"] == "two"
+
+
+def test_build_passages_preserves_retrieval_and_reference_metadata() -> None:
+    utterances = pl.DataFrame(
+        {
+            "work": ["one", "one"],
+            "speaker": ["A", "B"],
+            "text": ["topic-ready first", "topic-ready second"],
+            "original_text": ["Original first", "Original second"],
+            "sequence": [1, 2],
+            "utterance_id": ["u1", "u2"],
+            "source_passage_id": ["urn:1", "urn:2"],
+            "section_start": ["10a", "10b"],
+            "section_end": ["10b", "10c"],
+            "stephanus_markers": [["10a", "10b"], ["10c"]],
+            "source_path": ["one.xml", "one.xml"],
+        }
+    )
+
+    passage = build_passages(utterances, target_words=4).row(0, named=True)
+
+    assert passage["original_text"] == "Original first Original second"
+    assert passage["utterance_id_start"] == "u1"
+    assert passage["utterance_id_end"] == "u2"
+    assert passage["source_passage_ids"] == "urn:1|urn:2"
+    assert passage["section_start"] == "10a"
+    assert passage["section_end"] == "10c"
+    assert passage["stephanus_start"] == "10a"
+    assert passage["stephanus_end"] == "10c"
 
 
 def test_topic_analysis_produces_tidy_visualization_tables() -> None:

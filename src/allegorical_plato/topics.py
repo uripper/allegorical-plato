@@ -89,10 +89,50 @@ def _passage_row(chunk: list[dict[str, Any]], passage_number: int) -> dict[str, 
         "word_count": total_words,
         "utterance_count": len(chunk),
     }
+    if "original_text" in chunk[0]:
+        row["original_text"] = " ".join(
+            clean_text(str(item["original_text"]))
+            for item in chunk
+            if item["original_text"] is not None
+        )
     if "sequence" in chunk[0]:
         values = [item["sequence"] for item in chunk if item["sequence"] is not None]
         row["sequence_start"] = min(values, default=None)
         row["sequence_end"] = max(values, default=None)
+    if "utterance_id" in chunk[0]:
+        values = [str(item["utterance_id"]) for item in chunk if item["utterance_id"]]
+        row["utterance_id_start"] = values[0] if values else None
+        row["utterance_id_end"] = values[-1] if values else None
+        row["source_utterance_ids"] = "|".join(values)
+    if "source_passage_id" in chunk[0]:
+        values = list(
+            dict.fromkeys(
+                str(item["source_passage_id"]) for item in chunk if item["source_passage_id"]
+            )
+        )
+        row["source_passage_ids"] = "|".join(values)
+    if "section_start" in chunk[0]:
+        starts = [str(item["section_start"]) for item in chunk if item["section_start"]]
+        ends = [str(item["section_end"]) for item in chunk if item["section_end"]]
+        row["section_start"] = starts[0] if starts else None
+        row["section_end"] = ends[-1] if ends else None
+    if "stephanus_markers" in chunk[0]:
+        markers = list(
+            dict.fromkeys(
+                str(marker)
+                for item in chunk
+                for marker in (item["stephanus_markers"] or [])
+                if marker
+            )
+        )
+        row["stephanus_start"] = markers[0] if markers else None
+        row["stephanus_end"] = markers[-1] if markers else None
+        row["stephanus_markers"] = "|".join(markers)
+    if "source_path" in chunk[0]:
+        paths = list(
+            dict.fromkeys(str(item["source_path"]) for item in chunk if item["source_path"])
+        )
+        row["source_path"] = "|".join(paths)
     return row
 
 

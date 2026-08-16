@@ -5,12 +5,18 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Annotated
 
+import polars as pl
 import typer
 
 from allegorical_plato.corpus import load_corpus, profile
 from allegorical_plato.features import contrast_terms, distinctive_terms, group_socrates
+from allegorical_plato.structure import StructuralAnalysis, analyze_structure
 from allegorical_plato.topics import analyze_topics, build_passages
-from allegorical_plato.viz import render_topic_visuals
+from allegorical_plato.viz import (
+    render_dialogue_structure,
+    render_dialogue_structures,
+    render_topic_visuals,
+)
 
 app = typer.Typer(no_args_is_help=True, help="Explore linguistic patterns in Plato's corpus.")
 DEFAULT_DATA_PATH = Path(os.environ.get("ALLEGORICAL_PLATO_DATA", "data/corpus/utterances.parquet"))
@@ -29,6 +35,46 @@ class Comparison(StrEnum):
 
 def _languages(language: Language | None) -> list[Language]:
     return [language] if language else list(Language)
+
+
+def _read_analysis_table(directory: Path, name: str) -> pl.DataFrame:
+    for suffix, reader in ((".parquet", pl.read_parquet), (".csv", pl.read_csv)):
+        path = directory / f"{name}{suffix}"
+        if path.is_file():
+            return reader(path)
+    raise FileNotFoundError(f"Missing analysis table: {directory / name}.parquet or .csv")
+
+
+def _write_structure_tables(
+    result: StructuralAnalysis, structure_dir: Path, *, csv: bool = True
+) -> None:
+    structure_dir.mkdir(parents=True, exist_ok=True)
+    tables = {
+        "passage_metrics": result.passage_metrics,
+        "transitions": result.transitions,
+        "dialogue_symmetry": result.dialogue_symmetry,
+        "symmetry_pairs": result.symmetry_pairs,
+        "trajectory_matches": result.trajectory_matches,
+    }
+    for name, table in tables.items():
+        output = structure_dir / f"{name}.parquet"
+        table.write_parquet(output)
+        if csv:
+            table.write_csv(output.with_suffix(".csv"))
+
+
+def _work_titles() -> dict[str, str]:
+    works_path = DEFAULT_DATA_PATH.parent / "works.parquet"
+    if not works_path.is_file():
+        return {}
+    works = pl.read_parquet(works_path)
+    if not {"work_id", "canonical_title"}.issubset(works.columns):
+        return {}
+    return {
+        str(work): str(title)
+        for work, title in works.select("work_id", "canonical_title").iter_rows()
+        if title
+    }
 
 
 @app.command()
@@ -161,7 +207,7 @@ def topics(
             work_column=work_column,
             language=selected.value,
         )
-        passages = build_passages(corpus.utterances, target_words=target_words)
+        passages = build_passages(corpus.topic_utterances, target_words=target_words)
         result = analyze_topics(
             passages,
             language=selected.value,
@@ -203,15 +249,145 @@ def visuals(
     svg: Annotated[bool, typer.Option(help="Write scalable SVG images.")] = True,
     dpi: Annotated[int, typer.Option(min=72, max=600)] = 220,
 ) -> None:
-    """Render a coordinated suite of static topic visualizations."""
+    """Render corpus topic charts and every dialogue's structural reading profile."""
     formats = [name for name, enabled in (("png", png), ("svg", svg)) if enabled]
     if not formats:
         raise typer.BadParameter("Enable at least one of --png or --svg")
     for selected in _languages(language):
         topic_dir = input_dir / selected.value / "topics"
         visual_dir = output_dir / selected.value / "visuals"
-        written = render_topic_visuals(topic_dir, visual_dir, formats=formats, dpi=dpi)
-        typer.echo(f"Wrote {len(written)} {selected.value} visual files to {visual_dir}")
+        topic_written = render_topic_visuals(topic_dir, visual_dir, formats=formats, dpi=dpi)
+        passages = _read_analysis_table(topic_dir, "passages")
+        structural = analyze_structure(
+            passages,
+            _read_analysis_table(topic_dir, "passage_topics"),
+        )
+        structure_dir = output_dir / selected.value / "structure"
+        _write_structure_tables(structural, structure_dir)
+        structure_written = render_dialogue_structures(
+            topic_dir,
+            structure_dir,
+            visual_dir,
+            work_titles=_work_titles(),
+            formats=formats,
+            dpi=dpi,
+        )
+        dialogue_count = passages["work"].n_unique()
+        typer.echo(
+            f"Wrote {len(topic_written)} corpus charts, structural tables, "
+            f"and profiles for all {dialogue_count} {selected.value} dialogues to {visual_dir}"
+        )
+        typer.echo(f"Open {structure_written[-1]} to browse the candidates and source references")
+
+
+@app.command("analyze-structure")
+def structure_analysis(
+    input_dir: Annotated[
+        Path, typer.Option("--input-dir", "-i", help="Root containing language/topic tables.")
+    ] = Path("outputs"),
+    output_dir: Annotated[
+        Path, typer.Option("--output-dir", "-o", help="Root for structural-analysis tables.")
+    ] = Path("outputs"),
+    language: Annotated[Language | None, typer.Option(help="Analyze only one language.")] = None,
+    neighborhood: Annotated[
+        int, typer.Option(min=1, help="Passages on each side used by local anomaly.")
+    ] = 3,
+    symmetry_window: Annotated[
+        int, typer.Option(min=1, help="Odd centered window for mirrored comparisons.")
+    ] = 3,
+    null_iterations: Annotated[
+        int, typer.Option(min=1, help="Block-permutation samples per dialogue.")
+    ] = 1_000,
+    null_block_size: Annotated[
+        int, typer.Option(min=1, help="Contiguous passages retained within each null block.")
+    ] = 5,
+    trajectory_window: Annotated[
+        int, typer.Option(min=2, help="Passages in a recurring-trajectory window.")
+    ] = 5,
+    trajectory_min_movement: Annotated[
+        float,
+        typer.Option(
+            min=0.0,
+            max=1.0,
+            help="Minimum mean adjacent JS divergence for trajectory matching.",
+        ),
+    ] = 0.02,
+    max_trajectory_matches: Annotated[int, typer.Option(min=1)] = 100,
+    seed: Annotated[int, typer.Option(help="Random seed for reproducible null models.")] = 42,
+    csv: Annotated[bool, typer.Option(help="Also write CSV tables for manual browsing.")] = True,
+) -> None:
+    """Measure transitions, anomalies, symmetry, and recurring topic trajectories."""
+    if symmetry_window % 2 == 0:
+        raise typer.BadParameter("--symmetry-window must be odd")
+    for selected in _languages(language):
+        topic_dir = input_dir / selected.value / "topics"
+        passages = _read_analysis_table(topic_dir, "passages")
+        passage_topics = _read_analysis_table(topic_dir, "passage_topics")
+        result = analyze_structure(
+            passages,
+            passage_topics,
+            neighborhood_size=neighborhood,
+            symmetry_window=symmetry_window,
+            null_iterations=null_iterations,
+            null_block_size=null_block_size,
+            trajectory_window=trajectory_window,
+            trajectory_min_movement=trajectory_min_movement,
+            max_trajectory_matches=max_trajectory_matches,
+            random_state=seed,
+        )
+        structure_dir = output_dir / selected.value / "structure"
+        _write_structure_tables(result, structure_dir, csv=csv)
+        typer.echo(
+            f"Wrote {result.passage_metrics.height:,} {selected.value} passage metrics, "
+            f"{result.transitions.height:,} boundaries, and "
+            f"{result.trajectory_matches.height:,} cross-dialogue matches to {structure_dir}"
+        )
+
+
+@app.command("render-structure")
+def structural_visuals(
+    input_dir: Annotated[
+        Path, typer.Option("--input-dir", "-i", help="Root containing analysis tables.")
+    ] = Path("outputs"),
+    output_dir: Annotated[
+        Path, typer.Option("--output-dir", "-o", help="Root for rendered visualizations.")
+    ] = Path("outputs"),
+    language: Annotated[Language | None, typer.Option(help="Render only one language.")] = None,
+    work: Annotated[
+        str | None,
+        typer.Option(help="Exact work ID or unique suffix; defaults to the largest dialogue."),
+    ] = None,
+    png: Annotated[bool, typer.Option(help="Write high-resolution PNG images.")] = True,
+    svg: Annotated[bool, typer.Option(help="Write scalable SVG images.")] = True,
+    dpi: Annotated[int, typer.Option(min=72, max=600)] = 220,
+) -> None:
+    """Render a structural profile for one dialogue in each selected language."""
+    formats = [name for name, enabled in (("png", png), ("svg", svg)) if enabled]
+    if not formats:
+        raise typer.BadParameter("Enable at least one of --png or --svg")
+    for selected in _languages(language):
+        language_dir = input_dir / selected.value
+        visual_dir = output_dir / selected.value / "visuals"
+        if work:
+            written = render_dialogue_structure(
+                language_dir / "topics",
+                language_dir / "structure",
+                visual_dir,
+                work=work,
+                work_titles=_work_titles(),
+                formats=formats,
+                dpi=dpi,
+            )
+        else:
+            written = render_dialogue_structures(
+                language_dir / "topics",
+                language_dir / "structure",
+                visual_dir,
+                work_titles=_work_titles(),
+                formats=formats,
+                dpi=dpi,
+            )
+        typer.echo(f"Wrote {len(written)} {selected.value} structural files to {visual_dir}")
 
 
 if __name__ == "__main__":

@@ -48,19 +48,52 @@ class Corpus:
     @property
     def utterances(self) -> pl.DataFrame:
         """Return normalized, non-empty speaker/text pairs for one language."""
-        columns = [
-            pl.col(self.work_column).cast(pl.String).alias("work"),
-            pl.col(self.speaker_column).cast(pl.String).str.strip_chars().alias("speaker"),
-            pl.col(self.text_column).cast(pl.String).str.strip_chars().alias("text"),
-        ]
-        columns.extend(
-            pl.col(optional)
-            for optional in ("utterance_id", "sequence", "source_path")
-            if optional in self.frame.columns
-        )
+        return self._utterances(topic_fallback=False)
+
+    @property
+    def topic_utterances(self) -> pl.DataFrame:
+        """Return ordered topic text, falling back for works without speech markup."""
+        return self._utterances(topic_fallback=True)
+
+    def _utterances(self, *, topic_fallback: bool) -> pl.DataFrame:
         frame = self.frame
         if "segment_type" in frame.columns:
-            frame = frame.filter(pl.col("segment_type") == "speech")
+            if topic_fallback:
+                speech_works = frame.filter(pl.col("segment_type") == "speech")[
+                    self.work_column
+                ].unique()
+                frame = frame.filter(
+                    (pl.col("segment_type") == "speech")
+                    | (
+                        (~pl.col(self.work_column).is_in(speech_works.implode()))
+                        & pl.col("segment_type").is_in(["narration", "unattributed_speech"])
+                    )
+                )
+            else:
+                frame = frame.filter(pl.col("segment_type") == "speech")
+        speaker = pl.col(self.speaker_column).cast(pl.String).str.strip_chars()
+        if topic_fallback:
+            speaker = speaker.fill_null("unattributed").replace("", "unattributed")
+        columns = [
+            pl.col(self.work_column).cast(pl.String).alias("work"),
+            speaker.alias("speaker"),
+            pl.col(self.text_column).cast(pl.String).str.strip_chars().alias("text"),
+        ]
+        if "text_clean" in self.frame.columns:
+            columns.append(pl.col("text_clean").cast(pl.String).alias("original_text"))
+        passthrough = (
+            "utterance_id",
+            "sequence",
+            "source_path",
+            "section_start",
+            "section_end",
+            "stephanus_markers",
+        )
+        columns.extend(
+            pl.col(optional) for optional in passthrough if optional in self.frame.columns
+        )
+        if "passage_id" in self.frame.columns:
+            columns.append(pl.col("passage_id").alias("source_passage_id"))
         return frame.select(columns).filter(
             pl.col("work").is_not_null()
             & pl.col("speaker").is_not_null()

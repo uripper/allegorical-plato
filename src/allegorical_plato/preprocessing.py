@@ -6,6 +6,7 @@ import re
 import unicodedata
 from collections import Counter
 from collections.abc import Iterable, Sequence
+from itertools import pairwise
 
 from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
 
@@ -177,6 +178,7 @@ GREEK_FUNCTION_WORDS = frozenset(
         "τας",
         "τοις",
         "ταις",
+        "τοινυν",
         "τους",
         "υπερ",
         "υπο",
@@ -270,6 +272,9 @@ GREEK_DIALOGUE_WORDS = frozenset(
         "δι",
         "εγωγε",
         "ελεγε",
+        "ελεγον",
+        "ειπον",
+        "ειπε",
         "εοικε",
         "εοικεν",
         "εμοιγε",
@@ -330,6 +335,22 @@ def tokenize(text: str) -> list[str]:
     return [
         unicodedata.normalize("NFC", token.lower()) for token in TOKEN_RE.findall(clean_text(text))
     ]
+
+
+def topic_tokens(text: str, *, language: str) -> list[str]:
+    """Return topic tokens, matching stoplists through accent-folded forms."""
+    stops = function_words(language) | dialogue_words(language)
+    return [token for token in tokenize(text) if fold_token(token) not in stops]
+
+
+def topic_features(document: str, *, language: str) -> list[str]:
+    """Build unigram/bigram features without crossing newline utterance boundaries."""
+    features: list[str] = []
+    for utterance in document.splitlines() or [document]:
+        tokens = topic_tokens(utterance, language=language)
+        features.extend(tokens)
+        features.extend(f"{left} {right}" for left, right in pairwise(tokens) if left != right)
+    return features
 
 
 def function_words(language: str) -> frozenset[str]:
